@@ -19,6 +19,9 @@ export interface SchedulerDeps {
  * Look-ahead scheduler. Events are handed to the MIDI output slightly ahead of
  * time with precise timestamps, so JS timer jitter never reaches the module.
  * The scheduler owns no DOM or Vue state, so it is fully testable with fake timers.
+ *
+ * It knows nothing about ports: `send` gets every event, gates and sync clock ticks alike,
+ * and the transport routes them. Only note-on and note-off events are tracked as sounding.
  */
 export class Scheduler {
   private events: MidiEvent[] = []
@@ -115,13 +118,20 @@ export class Scheduler {
     return Math.min(elapsed, this.duration)
   }
 
+  /**
+   * When the next message can go out: now, or after the last event already handed to the output
+   * while running, since queued events cannot be taken back. A new pass starts here (see
+   * `start`), and so should anything the transport sends alongside it, such as sync messages.
+   */
+  queuedUntil(): number {
+    const now = this.deps.now()
+    return this.running ? Math.max(now, this.lastSentAt) : now
+  }
+
   start(fromSeconds = 0): void {
-    let anchor = this.deps.now()
-    if (this.running) {
-      // Events already handed to the output stay queued, so the new pass begins after them.
-      anchor = Math.max(anchor, this.lastSentAt)
-      this.stop(false)
-    }
+    // Events already handed to the output stay queued, so the new pass begins after them.
+    const anchor = this.queuedUntil()
+    if (this.running) this.stop(false)
     if (this.duration <= 0) return
     const from = Math.max(0, Math.min(fromSeconds, this.duration))
     this.running = true
@@ -143,7 +153,7 @@ export class Scheduler {
     for (let i = 0; i < this.index; i++) {
       const event = this.events[i]!
       if (event.kind === 'on') open.set(event.note, event)
-      else open.delete(event.note)
+      else if (event.kind === 'off') open.delete(event.note)
     }
     if (open.size === 0) return
     const at = this.startMs + from * 1000
@@ -189,7 +199,7 @@ export class Scheduler {
       this.deps.send(event.data, at)
       this.lastSentAt = at
       if (event.kind === 'on') this.sounding.set(event.note, noteOffFor(event.data))
-      else this.sounding.delete(event.note)
+      else if (event.kind === 'off') this.sounding.delete(event.note)
       this.index += 1
     }
 

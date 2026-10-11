@@ -7,6 +7,7 @@ import {
   locate,
   locateStep,
   loopRangeSeconds,
+  quarterNotesAt,
   resolveSwings,
   resolveTempos,
   stepDurationSeconds,
@@ -210,5 +211,28 @@ describe('formatDuration', () => {
     expect(formatDuration(0)).toBe('0:00')
     expect(formatDuration(65.9)).toBe('1:05')
     expect(formatDuration(-3)).toBe('0:00')
+  })
+})
+
+describe('quarterNotesAt', () => {
+  const tl = buildTimeline({
+    sections: [
+      createSection({ id: 'a', tempo: 120, bars: 1 }), // 2 s: 4 quarter notes
+      createSection({ id: 'b', tempo: 60, bars: 1, timeSignature: { beats: 3, unit: 8 } }), // 3 eighths: 1.5 s, 1.5 quarter notes
+    ],
+  })
+
+  it("counts quarter notes at each section's tempo, whatever its time signature", () => {
+    expect(quarterNotesAt(tl, 0)).toBe(0)
+    expect(quarterNotesAt(tl, 1)).toBe(2)
+    expect(quarterNotesAt(tl, 2)).toBe(4)
+    expect(quarterNotesAt(tl, 3)).toBeCloseTo(5)
+    expect(quarterNotesAt(tl, 3.5)).toBeCloseTo(5.5)
+  })
+
+  it('counts nothing before the song and stops counting at its end', () => {
+    expect(quarterNotesAt(tl, -1)).toBe(0)
+    expect(quarterNotesAt(tl, 99)).toBeCloseTo(5.5)
+    expect(quarterNotesAt([], 5)).toBe(0)
   })
 })

@@ -18,6 +18,22 @@ export { DEFAULT_PLAY_GATE_NOTE }
 export const CLOCK_NOTE = 98
 export const CLOCK_PULSES_PER_BEAT = 16
 
+/**
+ * System messages for the sync output, which lets a DAW or other MIDI gear follow the transport:
+ * Timing Clock ticks MIDI_CLOCKS_PER_QUARTER times per quarter note while the song plays, Start,
+ * Continue and Stop follow the transport, and Song Position Pointer says where a Continue picks
+ * up, in MIDI beats (sixteenth notes, MIDI_BEATS_PER_QUARTER to a quarter note).
+ */
+export const TIMING_CLOCK = 0xf8
+export const START = 0xfa
+export const CONTINUE = 0xfb
+export const STOP = 0xfc
+export const SONG_POSITION = 0xf2
+export const MIDI_CLOCKS_PER_QUARTER = 24
+export const MIDI_BEATS_PER_QUARTER = 4
+/** Song Position Pointer is a 14-bit count: 16383 MIDI beats, a little over 1000 bars of 4/4. */
+export const MAX_SONG_POSITION = 0x3fff
+
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const
 
 /** Status byte for a channel message. `channel` is 1-based (1..16). */
@@ -41,6 +57,21 @@ export function noteOffFor(noteOnData: readonly number[]): number[] {
 
 export function allNotesOff(channel: number): number[] {
   return [statusByte(CONTROL_CHANGE, channel), CC_ALL_NOTES_OFF, 0]
+}
+
+/**
+ * Song Position Pointer for a point `quarterNotes` from the start of the song, as the 14-bit
+ * count of MIDI beats (sixteenth notes) the message carries, least significant 7 bits first.
+ * The count is rounded to the nearest beat and clamped to what 14 bits can hold.
+ */
+export function songPositionPointer(quarterNotes: number): number[] {
+  const beats = clamp(Math.round(quarterNotes * MIDI_BEATS_PER_QUARTER), 0, MAX_SONG_POSITION)
+  return [SONG_POSITION, beats & 0x7f, beats >> 7]
+}
+
+/** Whether a message is a system real-time message (clock and transport), which belongs on the sync output. */
+export function isRealTime(data: readonly number[]): boolean {
+  return (data[0] ?? 0) >= TIMING_CLOCK
 }
 
 /** Module output (0..61) -> MIDI note number. Throws if the result leaves 0..127. */

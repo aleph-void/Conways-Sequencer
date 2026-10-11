@@ -1,6 +1,12 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { OUTPUT_STORAGE_KEY, useMidiStore, type MidiAccessLike, type MidiOutputLike } from './midi'
+import {
+  OUTPUT_STORAGE_KEY,
+  SYNC_OUTPUT_STORAGE_KEY,
+  useMidiStore,
+  type MidiAccessLike,
+  type MidiOutputLike,
+} from './midi'
 
 function fakeOutput(id: string, name = id): MidiOutputLike & { sent: Array<[number[], number | undefined]> } {
   const sent: Array<[number[], number | undefined]> = []
@@ -163,5 +169,77 @@ describe('useMidiStore', () => {
     store.outputs = [{ id: 'x', name: 'x', manufacturer: '', state: 'connected' }]
     store.refreshOutputs()
     expect(store.outputs).toEqual([])
+  })
+})
+
+describe('useMidiStore sync output', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    setActivePinia(createPinia())
+  })
+
+  it('starts with no sync output, even when the only output is picked for the module', async () => {
+    const store = useMidiStore()
+    await store.requestAccess(async () => fakeAccess([fakeOutput('a')]))
+    expect(store.selectedOutputId).toBe('a')
+    expect(store.syncOutputId).toBeNull()
+    expect(store.syncOutput).toBeNull()
+    expect(store.isSyncConnected).toBe(false)
+    expect(store.sendSync([0xf8])).toBe(false)
+  })
+
+  it("selects a sync output, remembers it and keeps its messages apart from the module's", async () => {
+    const store = useMidiStore()
+    const a = fakeOutput('a')
+    const b = fakeOutput('b')
+    await store.requestAccess(async () => fakeAccess([a, b]))
+    store.selectOutput('a')
+    store.selectSyncOutput('b')
+    expect(store.syncOutput?.id).toBe('b')
+    expect(store.isSyncConnected).toBe(true)
+    expect(localStorage.getItem(SYNC_OUTPUT_STORAGE_KEY)).toBe('b')
+    expect(store.sendSync([0xfa], 5)).toBe(true)
+    expect(store.send([0x90, 36, 100], 5)).toBe(true)
+    expect(b.sent).toEqual([[[0xfa], 5]])
+    expect(a.sent).toEqual([[[0x90, 36, 100], 5]])
+    expect(store.syncSentCount).toBe(1)
+    expect(store.sentCount).toBe(1)
+    store.selectSyncOutput(null)
+    expect(localStorage.getItem(SYNC_OUTPUT_STORAGE_KEY)).toBeNull()
+    expect(store.isSyncConnected).toBe(false)
+  })
+
+  it("restores the sync output from storage, and it may be the module's port", async () => {
+    localStorage.setItem(SYNC_OUTPUT_STORAGE_KEY, 'a')
+    setActivePinia(createPinia())
+    const store = useMidiStore()
+    const a = fakeOutput('a')
+    await store.requestAccess(async () => fakeAccess([a]))
+    expect(store.selectedOutput?.id).toBe('a')
+    expect(store.syncOutput?.id).toBe('a')
+    store.sendSync([0xfc])
+    expect(a.sent).toEqual([[[0xfc], undefined]])
+  })
+
+  it('keeps the preference while the device is unplugged and reports a port that fails', async () => {
+    const store = useMidiStore()
+    const access = fakeAccess([fakeOutput('a'), fakeOutput('b')])
+    await store.requestAccess(async () => access)
+    store.selectSyncOutput('b')
+    access.outputs.delete('b')
+    access.onstatechange?.({})
+    expect(store.syncOutputId).toBe('b')
+    expect(store.isSyncConnected).toBe(false)
+    expect(store.sendSync([0xf8])).toBe(false)
+    const bad = fakeOutput('b')
+    bad.send = () => {
+      throw new Error('closed')
+    }
+    access.outputs.set('b', bad)
+    access.onstatechange?.({})
+    expect(store.isSyncConnected).toBe(true)
+    expect(store.sendSync([0xf8])).toBe(false)
+    store.reset()
+    expect(store.syncSentCount).toBe(0)
   })
 })

@@ -1,13 +1,36 @@
-import { CLOCK_NOTE, CLOCK_PULSES_PER_BEAT, noteOff, noteOffFor, noteOn, outputToNote } from './midi'
+import {
+  CLOCK_NOTE,
+  CLOCK_PULSES_PER_BEAT,
+  MIDI_CLOCKS_PER_QUARTER,
+  TIMING_CLOCK,
+  noteOff,
+  noteOffFor,
+  noteOn,
+  outputToNote,
+} from './midi'
 import { cellDivision, gatesOf, isChannelSilenced, type Gate, type Section, type Song } from './song'
 import { buildTimeline, stepOffsetSeconds, totalDuration, type SectionTiming } from './timing'
 
 export interface MidiEvent {
   /** Seconds from song start. */
   time: number
-  kind: 'on' | 'off'
+  /** A gate's note-on or note-off for the module, or a MIDI clock tick for the sync output. */
+  kind: 'on' | 'off' | 'clock'
+  /** The note the gate is on, or NO_NOTE for a clock tick, which belongs to no gate. */
   note: number
   data: number[]
+}
+
+/** The `note` of an event that is not about a note at all (a sync clock tick). */
+export const NO_NOTE = -1
+
+export interface CompileOptions {
+  /**
+   * Also emit the MIDI clock for the sync output: a Timing Clock tick MIDI_CLOCKS_PER_QUARTER
+   * times per quarter note, following each section's tempo. Off by default, since without a
+   * sync output the ticks would have nowhere to go.
+   */
+  syncClock?: boolean
 }
 
 export interface CompiledSong {
@@ -20,7 +43,8 @@ export interface CompiledSong {
 export const MIN_GAP_SECONDS = 0.002
 
 /**
- * Turn a song into a flat, time-sorted list of MIDI events.
+ * Turn a song into a flat, time-sorted list of MIDI events, for the module and, when asked, the
+ * sync output.
  *
  * A gate goes high at the start of an on-step and stays high for the whole step. If the
  * following step is also on, the gate is held through it, so a run of consecutive on-steps
@@ -36,9 +60,13 @@ export const MIN_GAP_SECONDS = 0.002
  * solo never touch it, and neither does swing: like a DAW's MIDI clock it stays straight, so
  * gear following it keeps time while the gates shuffle around it.
  *
- * Pure: the same song always yields the same events.
+ * With `syncClock`, MIDI clock ticks for the sync output are compiled in as well (see
+ * `pushSyncClock`), so they share the scheduler's timeline with the gates and stay locked to
+ * them through tempo changes and loops.
+ *
+ * Pure: the same song and options always yield the same events.
  */
-export function compileSong(song: Song): CompiledSong {
+export function compileSong(song: Song, options: CompileOptions = {}): CompiledSong {
   const timeline = buildTimeline(song)
   const events: MidiEvent[] = []
   const { midiChannel, baseNote, velocity } = song.settings
@@ -47,6 +75,7 @@ export function compileSong(song: Song): CompiledSong {
     const section = song.sections[timing.index]
     if (!section) continue
     pushClock(events, timing, section, midiChannel, velocity)
+    if (options.syncClock) pushSyncClock(events, timing)
     for (const channel of song.channels) {
       if (isChannelSilenced(channel, song.channels)) continue
       const steps = section.steps[channel.id]
@@ -81,7 +110,10 @@ function gateSeconds(timing: SectionTiming, gate: Gate): { start: number; length
   return { start, length: Math.max(MIN_GAP_SECONDS, share - MIN_GAP_SECONDS) }
 }
 
-/** Sort by time; at equal times send note-offs before note-ons so a new gate on the same note works. */
+/**
+ * Sort by time; at equal times send note-offs before note-ons so a new gate on the same note
+ * works, with clock ticks in between (they go to another output, so only determinism matters).
+ */
 function sortEvents(events: MidiEvent[]): MidiEvent[] {
   return events.sort((a, b) => a.time - b.time || rank(a) - rank(b) || a.note - b.note)
 }
@@ -94,7 +126,7 @@ function sortEvents(events: MidiEvent[]): MidiEvent[] {
  * that is already high when the window starts gets a note-on at 0, and one still high when
  * it ends gets a note-off just before the end (MIN_GAP_SECONDS early, like every gate
  * before a following step), so that looping the window re-triggers it cleanly and nothing
- * is left hanging. The x16 clock is cut the same way.
+ * is left hanging. The x16 clock and the MIDI clock are cut the same way.
  */
 export function windowEvents(events: readonly MidiEvent[], start: number, end: number): MidiEvent[] {
   const duration = end - start
@@ -113,7 +145,7 @@ export function windowEvents(events: readonly MidiEvent[], start: number, end: n
     }
     if (inside) out.push({ ...event, time: Math.max(0, event.time - start) })
     if (event.kind === 'on') high.set(event.note, event)
-    else high.delete(event.note)
+    else if (event.kind === 'off') high.delete(event.note)
   }
   if (!inside) for (const on of high.values()) out.push({ ...on, time: 0 })
   // Whatever is still high at the end is released just before the window ends.
@@ -143,6 +175,26 @@ function pushClock(events: MidiEvent[], timing: SectionTiming, section: Section,
   }
 }
 
+/**
+ * Emit the MIDI clock for one section: a Timing Clock tick MIDI_CLOCKS_PER_QUARTER times per
+ * quarter note at the section's tempo. As the MIDI spec has it, the rate follows the quarter
+ * note whatever the time signature (a beat of x/8 gets half as many ticks), unlike the module's
+ * x16 clock, which follows the beat. Like that clock it is never swung.
+ */
+function pushSyncClock(events: MidiEvent[], timing: SectionTiming) {
+  const period = midiClockPeriod(timing.tempo)
+  const ticks = Math.round(timing.duration / period)
+  const data = [TIMING_CLOCK]
+  for (let tick = 0; tick < ticks; tick++) {
+    events.push({ time: timing.startTime + tick * period, kind: 'clock', note: NO_NOTE, data })
+  }
+}
+
+/** Seconds from one MIDI clock tick to the next at a tempo in quarter notes per minute. */
+export function midiClockPeriod(tempo: number): number {
+  return 60 / tempo / MIDI_CLOCKS_PER_QUARTER
+}
+
 /** Seconds from one clock pulse to the next in a section: a beat split CLOCK_PULSES_PER_BEAT ways. */
 export function clockPeriod(timing: Pick<SectionTiming, 'stepDuration'>, section: Pick<Section, 'subdivision'>): number {
   return (timing.stepDuration * section.subdivision) / CLOCK_PULSES_PER_BEAT
@@ -154,5 +206,5 @@ export function clockPulseWidth(period: number): number {
 }
 
 function rank(e: MidiEvent): number {
-  return e.kind === 'off' ? 0 : 1
+  return e.kind === 'off' ? 0 : e.kind === 'clock' ? 1 : 2
 }

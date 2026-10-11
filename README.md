@@ -13,6 +13,14 @@ backend, and songs autosave to local storage.
 
 - **MIDI output picker.** Lists the outputs the browser can see, remembers your
   choice, and follows hot-plugging.
+- **MIDI sync output.** A second, optional output picker ("Sync", under the
+  interface picker) sends standard MIDI sync to a DAW, drum machine or any other
+  gear that follows MIDI clock: Timing Clock at 24 pulses per quarter note while
+  the song plays, Start when playback begins at the top of the song, Song
+  Position Pointer followed by Continue when it resumes or jumps anywhere else,
+  and Stop when it pauses or stops. Nothing else is sent to it, and it can be
+  the same port as the module's. The choice is remembered. See
+  [Syncing a DAW or other MIDI gear](#syncing-a-daw-or-other-midi-gear).
 - **Up to 62 channels** on the module's 64 outputs. Each channel maps to an
   output number (1–62), which becomes MIDI note `baseNote + output - 1`
   (output 1 = C2 / note 36 by default, as the module expects).
@@ -197,6 +205,36 @@ any other RUN MODE (such as RESET) will not follow the transport.
 Set Pam's internal BPM aside: in CV clock mode the displayed tempo follows the
 incoming clock, and the sequencer decides it from the section's tempo and time
 signature.
+
+## Syncing a DAW or other MIDI gear
+
+The x16 clock and play gate above sync gear through the module's outputs. Gear
+with a MIDI input (a DAW, a drum machine, a hardware sequencer, or a eurorack
+MIDI-to-clock module) can follow the transport directly instead: pick it in the
+**Sync** picker under the interface picker and set it to follow external MIDI
+clock (in a DAW, enable sync or "slave to MIDI clock" on that input).
+
+While the song plays, the sync output gets a MIDI Timing Clock tick 24 times per
+quarter note, following each section's tempo, including tempo changes between
+sections. As the MIDI specification has it, the rate follows the quarter note
+whatever the time signature (a beat of x/8 gets 12 ticks), unlike the module's
+x16 clock, which follows the beat. Swing never touches it. The transport
+messages follow the sequencer's:
+
+| Sequencer                                   | Sync output sends                        |
+| ------------------------------------------- | ---------------------------------------- |
+| Play from the top of the song               | Start                                    |
+| Resume, or play from anywhere else          | Song Position Pointer, then Continue     |
+| Reset or click a bar while playing          | Stop, then Start or Position + Continue  |
+| Pause, Stop, the end of a non-looping song  | Stop                                     |
+| Panic (Esc)                                 | Stop, even when already stopped          |
+
+Positions are counted from the start of the whole song, so when only the bars
+between the loop points play the receiver still lands on the same bar as the
+cursor. When the loop wraps the clock just keeps ticking: the receiver carries
+on forward rather than jumping back, as it would with a DAW's own loop. The
+clock is only sent while the song plays; gear that needs a clock while stopped
+to show a tempo will show its own until Play.
 
 ## Browser support
 

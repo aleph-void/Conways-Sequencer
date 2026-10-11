@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { MIN_GAP_SECONDS, compileSong, windowEvents, type MidiEvent } from './compile'
-import { CLOCK_NOTE } from './midi'
+import { MIN_GAP_SECONDS, NO_NOTE, compileSong, midiClockPeriod, windowEvents, type MidiEvent } from './compile'
+import { CLOCK_NOTE, TIMING_CLOCK } from './midi'
 import { createChannel, createSection, createSong, type Song } from './song'
 
 /** The drawn gates only: the clock is checked by its own tests below. */
@@ -343,5 +343,70 @@ describe('windowEvents', () => {
       ['on', 1.75], // steps 30–32 run past the bar line: released just before the window ends
       ['off', 1.998],
     ])
+  })
+})
+
+describe('MIDI clock', () => {
+  const ticks = (events: readonly MidiEvent[]) => events.filter((e) => e.kind === 'clock')
+
+  it('is left out unless asked for', () => {
+    expect(ticks(compileSong(song()).events)).toEqual([])
+    expect(ticks(compileSong(song(), {}).events)).toEqual([])
+  })
+
+  it('ticks 24 times per quarter note at the section tempo, leaving the rest untouched', () => {
+    const { events } = compileSong(song(), { syncClock: true }) // 1 bar of 4/4 at 120 BPM: 2 s, 4 quarter notes
+    const t = ticks(events)
+    expect(t).toHaveLength(96)
+    expect(t[0]).toEqual({ time: 0, kind: 'clock', note: NO_NOTE, data: [TIMING_CLOCK] })
+    expect(t[1]!.time).toBeCloseTo(midiClockPeriod(120), 9)
+    expect(t[24]!.time).toBeCloseTo(0.5, 9)
+    expect(t[95]!.time).toBeCloseTo(2 - midiClockPeriod(120), 9)
+    expect(events.filter((e) => e.kind !== 'clock')).toEqual(compileSong(song()).events)
+  })
+
+  it("follows the quarter note, not the beat, in x/8 time, and each section's tempo", () => {
+    const s = song()
+    s.sections = [
+      createSection({ id: 'a', tempo: 120, bars: 1, timeSignature: { beats: 6, unit: 8 } }), // 6 eighths: 3 quarter notes, 1.5 s
+      createSection({ id: 'b', tempo: 60, bars: 1 }), // 4 quarter notes, 4 s
+    ]
+    const t = ticks(compileSong(s, { syncClock: true }).events)
+    expect(t).toHaveLength(3 * 24 + 4 * 24)
+    expect(t[72]!.time).toBeCloseTo(1.5, 9)
+    expect(t[71]!.time).toBeCloseTo(1.5 - midiClockPeriod(120), 9)
+    expect(t[73]!.time - t[72]!.time).toBeCloseTo(midiClockPeriod(60), 9)
+  })
+
+  it('is not swung and ignores mute and solo', () => {
+    const s = song()
+    s.sections[0]!.swing = 75
+    s.channels[0]!.muted = true
+    s.channels[1]!.solo = true
+    const straight = ticks(compileSong(song(), { syncClock: true }).events).map((e) => e.time)
+    expect(ticks(compileSong(s, { syncClock: true }).events).map((e) => e.time)).toEqual(straight)
+  })
+
+  it('goes out before the note-ons that share its instant', () => {
+    const s = song()
+    s.sections[0]!.steps = { c0: [0] }
+    const { events } = compileSong(s, { syncClock: true })
+    expect(events.slice(0, 3).map((e) => [e.kind, e.time])).toEqual([
+      ['clock', 0],
+      ['on', 0],
+      ['on', 0],
+    ])
+  })
+
+  it('is cut to a window like everything else', () => {
+    const { events } = compileSong(song(), { syncClock: true })
+    const t = ticks(windowEvents(events, 0.5, 1))
+    expect(t).toHaveLength(24)
+    expect(t[0]!.time).toBe(0)
+    expect(t[23]!.time).toBeCloseTo(0.5 - midiClockPeriod(120), 9)
+  })
+
+  it('is deterministic', () => {
+    expect(compileSong(song(), { syncClock: true })).toEqual(compileSong(song(), { syncClock: true }))
   })
 })
