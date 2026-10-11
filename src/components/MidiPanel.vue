@@ -9,6 +9,17 @@ const selected = computed({
   set: (value: string) => midi.selectOutput(value || null),
 })
 
+const sync = computed({
+  get: () => midi.syncOutputId ?? '',
+  set: (value: string) => midi.selectSyncOutput(value || null),
+})
+
+const syncTitle =
+  'Also send MIDI clock, Start, Stop and Continue to this output, so a DAW or other MIDI gear follows the transport'
+
+/** The sync picker needs outputs to pick from; without any, the status line has the room to say so. */
+const showSync = computed(() => midi.status === 'ready' && midi.outputs.length > 0)
+
 const statusText = computed(() => {
   switch (midi.status) {
     case 'unsupported':
@@ -64,7 +75,18 @@ const statusClass = computed(() => {
         ⟳
       </button>
     </div>
-    <p class="status" :class="statusClass" data-testid="midi-status">{{ statusText }}</p>
+    <div class="detail" :class="{ contained: showSync }">
+      <label v-if="showSync" class="sync" :title="syncTitle">
+        <span>Sync</span>
+        <select v-model="sync" class="compact" data-testid="sync-output" aria-label="MIDI sync output">
+          <option value="">— none —</option>
+          <option v-for="o in midi.outputs" :key="o.id" :value="o.id">
+            {{ o.name }}<template v-if="o.manufacturer"> ({{ o.manufacturer }})</template>
+          </option>
+        </select>
+      </label>
+      <p class="status" :class="statusClass" :title="statusText" data-testid="midi-status">{{ statusText }}</p>
+    </div>
   </section>
 </template>
 
@@ -78,6 +100,40 @@ const statusClass = computed(() => {
 
 .row {
   align-items: center;
+}
+
+/*
+ * The sync picker shares the status line. With it there, the line must not size the panel
+ * (the toolbar would wrap at common laptop widths): it takes the width of the interface row
+ * above and the status text gives way, with the full text in its tooltip.
+ */
+.detail {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.detail.contained {
+  contain: inline-size;
+}
+
+.detail.contained .status {
+  flex: 1 1 auto;
+}
+
+.sync {
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+/* Narrow on purpose: the open list shows the full names, and the status line needs the room. */
+.compact {
+  width: 120px;
+  min-width: 0;
+  max-width: 120px;
+  padding: 2px 6px;
+  font-size: 11.5px;
 }
 
 .status {
@@ -110,6 +166,20 @@ select {
     flex: 1 1 auto;
     min-width: 0;
     max-width: none;
+  }
+
+  .compact {
+    width: auto;
+    max-width: 240px;
+  }
+
+  .detail {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+  }
+
+  .sync {
+    flex: 1 1 100%;
   }
 
   .status {

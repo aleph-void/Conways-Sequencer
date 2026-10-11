@@ -529,4 +529,144 @@ describe('useTransportStore', () => {
       expect(out.sent[1]).toEqual([[0x90, 36, 100], 0])
     })
   })
+
+  describe('sync output', () => {
+    let sync: ReturnType<typeof fakeOutput>
+    const data = () => sync.sent.map((s) => s[0])
+    const ticks = () => sync.sent.filter((s) => s[0][0] === 0xf8).map((s) => s[1]!)
+
+    beforeEach(async () => {
+      sync = fakeOutput()
+      sync.id = 'sync'
+      const midi = useMidiStore()
+      midi.reset()
+      const outputs = new Map<string, MidiOutputLike>([
+        ['o', out],
+        ['sync', sync],
+      ])
+      await midi.requestAccess(async () => ({ outputs, onstatechange: null }))
+      midi.selectOutput('o')
+      midi.selectSyncOutput('sync')
+    })
+
+    it('sends Start, then a clock tick every 24th of a quarter note while playing, then Stop', async () => {
+      const transport = useTransportStore()
+      transport.play()
+      expect(sync.sent[0]).toEqual([[0xfa], 0])
+      await vi.advanceTimersByTimeAsync(1000)
+      const t = ticks()
+      // 120 BPM: 24 ticks per 500 ms quarter note, one every 20.83 ms, the first on the Start.
+      expect(t[0]).toBe(0)
+      expect(t[1]).toBeCloseTo(1000 / 48, 6)
+      expect(t[24]).toBeCloseTo(500, 6)
+      expect(t.filter((at) => at < 1000)).toHaveLength(48)
+      // Only real-time messages reach the sync output, and no tick reaches the module.
+      expect(data().every((d) => d[0] === 0xfa || d[0] === 0xf8)).toBe(true)
+      expect(out.sent.some((s) => s[0][0] === 0xf8)).toBe(false)
+      transport.stop()
+      expect(sync.sent.at(-1)).toEqual([[0xfc], 1000])
+      const count = sync.sent.length
+      transport.stop()
+      await vi.advanceTimersByTimeAsync(500)
+      // A second stop says nothing more, and the clock stays silent while stopped.
+      expect(sync.sent).toHaveLength(count)
+    })
+
+    it('pauses with Stop and resumes with Song Position Pointer then Continue', async () => {
+      const transport = useTransportStore()
+      transport.play()
+      await vi.advanceTimersByTimeAsync(600)
+      transport.pause()
+      expect(sync.sent.at(-1)).toEqual([[0xfc], 600])
+      const before = sync.sent.length
+      transport.resume()
+      // 0.6 s at 120 BPM is 1.2 quarter notes: 4.8 MIDI beats, rounded to 5.
+      expect(sync.sent.slice(before, before + 2)).toEqual([
+        [[0xf2, 5, 0], 600],
+        [[0xfb], 600],
+      ])
+      // The ticks pick up with the first one at or after the cursor (the 29th, at 604.17 ms).
+      expect(sync.sent[before + 2]![0]).toEqual([0xf8])
+      expect(sync.sent[before + 2]![1]).toBeCloseTo((29 * 1000) / 48, 6)
+    })
+
+    it('restarts the sync after the queued ticks on reset and on seek while playing', async () => {
+      const transport = useTransportStore()
+      transport.play()
+      await vi.advanceTimersByTimeAsync(700)
+      const before = sync.sent.length
+      transport.reset()
+      // Stop, Start and the first tick of the new pass share one timestamp, after everything
+      // already handed to the outputs (up to the 120 ms look-ahead), so a receiver counting
+      // ticks from the Start counts exactly the new pass.
+      const restart = sync.sent.slice(before, before + 3)
+      expect(restart.map((s) => s[0])).toEqual([[0xfc], [0xfa], [0xf8]])
+      const at = restart[0]![1]!
+      expect(at).toBeGreaterThanOrEqual(700)
+      expect(at).toBeLessThanOrEqual(820)
+      expect(restart.map((s) => s[1])).toEqual([at, at, at])
+
+      await vi.advanceTimersByTimeAsync(400)
+      const mark = sync.sent.length
+      transport.seekToStep(40) // 5 s: 10 quarter notes, 40 MIDI beats
+      expect(sync.sent.slice(mark, mark + 3).map((s) => s[0])).toEqual([[0xfc], [0xf2, 40, 0], [0xfb]])
+      expect(transport.playing).toBe(true)
+    })
+
+    it('gives a loop range its position in the whole song, and Start only from the top', async () => {
+      const song = useSongStore()
+      song.setLoopRange(1, 3) // bars 2–3: 2 s in, 4 quarter notes, 16 MIDI beats
+      const transport = useTransportStore()
+      transport.play()
+      expect(data().slice(0, 2)).toEqual([[0xf2, 16, 0], [0xfb]])
+      await vi.advanceTimersByTimeAsync(4100)
+      // Through the wrap the clock just keeps ticking: the receiver is not moved back.
+      expect(data().filter((d) => d[0] !== 0xf8)).toEqual([[0xf2, 16, 0], [0xfb]])
+      transport.stop()
+      song.setLoopRange(0, 2)
+      await nextTick()
+      const mark = sync.sent.length
+      transport.play()
+      expect(sync.sent[mark]![0]).toEqual([0xfa])
+    })
+
+    it('feeds a sync output chosen while playing from where the song is, and drops one deselected', async () => {
+      const midi = useMidiStore()
+      midi.selectSyncOutput(null)
+      const transport = useTransportStore()
+      transport.play()
+      await vi.advanceTimersByTimeAsync(500)
+      expect(sync.sent).toEqual([])
+      midi.selectSyncOutput('sync')
+      await nextTick()
+      // The running pass is stopped and restarted in place: 0.5 s is 1 quarter note, 4 MIDI beats.
+      expect(data().slice(0, 4)).toEqual([[0xfc], [0xf2, 4, 0], [0xfb], [0xf8]])
+      await vi.advanceTimersByTimeAsync(500)
+      expect(ticks().length).toBeGreaterThan(20)
+      expect(transport.playing).toBe(true)
+      midi.selectSyncOutput(null)
+      await nextTick()
+      const count = sync.sent.length
+      await vi.advanceTimersByTimeAsync(500)
+      expect(sync.sent).toHaveLength(count)
+      expect(transport.playing).toBe(true)
+    })
+
+    it('sends one Stop from panic, playing or not', () => {
+      const transport = useTransportStore()
+      transport.panic()
+      expect(data()).toEqual([[0xfc]])
+      transport.play()
+      const before = sync.sent.length
+      transport.panic()
+      expect(sync.sent.slice(before).map((s) => s[0])).toEqual([[0xfc]])
+    })
+
+    it('sends nothing for a song that cannot play', () => {
+      const song = useSongStore()
+      song.removeSection(song.song.sections[0]!.id)
+      useTransportStore().play()
+      expect(sync.sent).toEqual([])
+    })
+  })
 })

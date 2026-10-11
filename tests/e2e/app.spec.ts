@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { enableMidi, expect, midiLog, test, type MidiLogEntry } from './fixtures'
 
 test.describe('shell', () => {
   test('loads with Aleph Void branding and a default song', async ({ midiPage: page }) => {
@@ -169,6 +169,49 @@ test.describe('MIDI output selection', () => {
     })
     await expect(page.getByTestId('midi-output').locator('option')).toHaveCount(2)
     await expect(page.getByTestId('midi-status')).toContainText('Select an output')
+  })
+
+  test('sends MIDI clock and transport messages to a separate sync output', async ({ midiPage: page }) => {
+    await enableMidi(page)
+    const sync = page.getByTestId('sync-output')
+    await expect(sync).toHaveValue('')
+    await sync.selectOption('other')
+    await expect(sync).toHaveValue('other')
+    await expect(page.getByTestId('midi-status')).toHaveText('Sending to Conway Interface')
+
+    await page.getByTestId('play').click()
+    const synced = (log: MidiLogEntry[]) => log.filter((e) => e.port === 'other')
+    await expect.poll(async () => synced(await midiLog(page)).length, { timeout: 5000 }).toBeGreaterThan(30)
+    await page.getByTestId('play').click() // pause
+    await expect(page.getByTestId('play')).toContainText('Resume')
+    let log = synced(await midiLog(page))
+    // Start, then Timing Clock 24 times per 500 ms quarter note, then Stop, and nothing else.
+    expect(log[0]!.data).toEqual([0xfa])
+    const ticks = log.filter((e) => e.data[0] === 0xf8)
+    expect(ticks.length).toBeGreaterThan(24)
+    expect(ticks[0]!.timestamp).toBeCloseTo(log[0]!.timestamp!, 0)
+    expect(ticks[24]!.timestamp! - ticks[0]!.timestamp!).toBeCloseTo(500, 1)
+    expect(log.at(-1)!.data).toEqual([0xfc])
+    expect(log.every((e) => [0xf8, 0xfa, 0xfc].includes(e.data[0]!))).toBe(true)
+    // The module's port saw none of it.
+    const module = (await midiLog(page)).filter((e) => e.port === 'conway')
+    expect(module.length).toBeGreaterThan(0)
+    expect(module.every((e) => e.data[0]! < 0xf0)).toBe(true)
+
+    // Resuming tells the receiver where to pick up, then continues.
+    const before = log.length
+    await page.getByTestId('play').click()
+    await expect.poll(async () => synced(await midiLog(page)).length).toBeGreaterThan(before + 2)
+    log = synced(await midiLog(page))
+    expect(log[before]!.data[0]).toBe(0xf2)
+    expect(log[before]!.data[1]).toBeGreaterThan(0)
+    expect(log[before + 1]!.data).toEqual([0xfb])
+    await page.getByTestId('stop').click()
+
+    // The choice is remembered across reloads.
+    await page.reload()
+    await page.getByTestId('enable-midi').click()
+    await expect(page.getByTestId('sync-output')).toHaveValue('other')
   })
 })
 

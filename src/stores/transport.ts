@@ -1,10 +1,10 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { compileSong, windowEvents } from '../core/compile'
-import { noteOff, noteOn } from '../core/midi'
+import { CONTINUE, START, STOP, isRealTime, noteOff, noteOn, songPositionPointer } from '../core/midi'
 import { Scheduler } from '../core/scheduler'
 import { clamp, type LoopRange } from '../core/song'
-import { locate, stepStartTime, type Position } from '../core/timing'
+import { locate, quarterNotesAt, stepStartTime, type Position } from '../core/timing'
 import { useMidiStore } from './midi'
 import { useSongStore } from './song'
 
@@ -22,6 +22,12 @@ function sameRange(a: LoopRange | null, b: LoopRange | null): boolean {
  * "The start" is the start of the song, or of the loop range when the song has loop points:
  * playback then stays between them (the scheduler is fed just that window of the song) and
  * the Loop setting decides whether it repeats or stops at the end of the range.
+ *
+ * Gear on the sync output (see the midi store) follows along: MIDI clock ticks are compiled
+ * into the scheduler's event list while a sync output is selected, Start or Song Position
+ * Pointer + Continue go out whenever a pass begins (play, resume, reset, seek, loop points that
+ * moved), and Stop whenever playback halts. Positions are those of the whole song, so a DAW
+ * lands on the same bar as the cursor even when only the loop range plays.
  */
 export const useTransportStore = defineStore('transport', () => {
   const songStore = useSongStore()
@@ -63,7 +69,8 @@ export const useTransportStore = defineStore('transport', () => {
   }
 
   const scheduler = new Scheduler({
-    send: (data, at) => midi.send(data, at),
+    // Gates and the x16 clock go to the module; MIDI clock ticks go to the sync output.
+    send: (data, at) => (isRealTime(data) ? midi.sendSync(data, at) : midi.send(data, at)),
     now,
     setTimeout: (fn, ms) => setTimeout(fn, ms),
     clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
@@ -96,12 +103,38 @@ export const useTransportStore = defineStore('transport', () => {
   }
 
   /**
+   * Tell the sync output where playback is about to go: Start when it is the top of the song,
+   * otherwise Song Position Pointer then Continue, so a DAW picks up at the same bar.
+   */
+  function syncStart(songSeconds: number, at: number) {
+    if (songSeconds <= 0) {
+      midi.sendSync([START], at)
+    } else {
+      midi.sendSync(songPositionPointer(quarterNotesAt(songStore.timeline, songSeconds)), at)
+      midi.sendSync([CONTINUE], at)
+    }
+  }
+
+  /**
+   * Begin a pass `offset` seconds into what plays, telling the sync output first. Everything is
+   * stamped after the events already queued at the outputs, so a receiver counting clock ticks
+   * from the Start or Continue counts exactly the ticks of the new pass; a pass that restarts a
+   * running one is a Stop followed by a fresh start, as far as the receiver can tell.
+   */
+  function start(offset: number) {
+    const at = scheduler.queuedUntil()
+    if (scheduler.isRunning) midi.sendSync([STOP], at)
+    syncStart(loadedStart + offset, at)
+    scheduler.start(offset)
+  }
+
+  /**
    * Hand the song, or the window of it between the loop points, to the scheduler. While
    * playing, an edit is picked up seamlessly; loop points that moved restart playback inside
    * the new range instead, carrying on from the same place when the cursor is still inside it.
    */
   function reload() {
-    const compiled = compileSong(songStore.song)
+    const compiled = compileSong(songStore.song, { syncClock: midi.isSyncConnected })
     const range = songStore.loopSeconds
     const nextRange = songStore.song.settings.loopRange
     const moved = playing.value && !sameRange(loadedRange, nextRange)
@@ -113,15 +146,17 @@ export const useTransportStore = defineStore('transport', () => {
     scheduler.load(events, loadedDuration, songStore.song.settings.loop)
     if (moved && scheduler.isRunning) {
       const from = was - loadedStart
-      scheduler.start(from > 0 && from < loadedDuration ? from : 0)
+      start(from > 0 && from < loadedDuration ? from : 0)
       positionSeconds.value = loadedStart + scheduler.position()
     }
   }
 
-  /** Stop the scheduler and the gate, leaving the cursor at `at` (stopped at the start, paused past it). */
+  /** Stop the scheduler, the gate and the sync, leaving the cursor at `at` (stopped at the start, paused past it). */
   function halt(at: number) {
+    const wasPlaying = playing.value
     scheduler.stop(false)
     releaseGate()
+    if (wasPlaying) midi.sendSync([STOP], now())
     stopFrames()
     playing.value = false
     positionSeconds.value = at
@@ -137,7 +172,7 @@ export const useTransportStore = defineStore('transport', () => {
     const from = offset > 0 && offset < loadedDuration ? offset : 0
     // The gate goes high before the first step so the module sees "playing" first.
     raiseGate()
-    scheduler.start(from)
+    start(from)
     playing.value = scheduler.isRunning
     if (playing.value) {
       paused.value = false
@@ -146,6 +181,7 @@ export const useTransportStore = defineStore('transport', () => {
       pump()
     } else {
       releaseGate()
+      midi.sendSync([STOP], now())
     }
   }
 
@@ -164,7 +200,7 @@ export const useTransportStore = defineStore('transport', () => {
   /** Return the cursor to the start. Playback, if running, restarts from there and keeps going. */
   function reset() {
     if (playing.value) {
-      scheduler.start(0)
+      start(0)
       positionSeconds.value = loadedStart
       return
     }
@@ -182,7 +218,7 @@ export const useTransportStore = defineStore('transport', () => {
     if (playing.value) {
       const offset = at - loadedStart
       if (offset >= 0 && offset < loadedDuration) {
-        scheduler.start(offset)
+        start(offset)
         positionSeconds.value = at
       } else {
         halt(at)
@@ -209,8 +245,12 @@ export const useTransportStore = defineStore('transport', () => {
     else play()
   }
 
+  /** Stop everything: the song, every output on the module and whatever follows the sync output. */
   function panic() {
+    const wasPlaying = playing.value
     stop()
+    // Stopping already told the sync output while playing; stopped, Esc still halts gear that runs on.
+    if (!wasPlaying) midi.sendSync([STOP], now())
     const { midiChannel, baseNote, playGateNote } = songStore.song.settings
     midi.panic(midiChannel, baseNote, playGateNote)
   }
@@ -228,9 +268,21 @@ export const useTransportStore = defineStore('transport', () => {
     (loop) => scheduler.setLoop(loop),
   )
 
+  // A sync output chosen while playing gets the clock from here on, and is told where the song
+  // is: the pass restarts in place so its ticks and its Continue line up. One deselected or
+  // unplugged just stops being fed.
+  watch(
+    () => (midi.isSyncConnected ? midi.syncOutputId : null),
+    (id) => {
+      if (!playing.value) return
+      reload()
+      if (id) start(scheduler.position())
+    },
+  )
+
   // A stopped cursor sits at the start of what plays, so it follows the loop points.
-  watch(loopStart, (start) => {
-    if (!playing.value && !paused.value) positionSeconds.value = start
+  watch(loopStart, (at) => {
+    if (!playing.value && !paused.value) positionSeconds.value = at
   })
 
   return {

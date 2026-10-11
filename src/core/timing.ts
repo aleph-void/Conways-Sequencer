@@ -142,6 +142,19 @@ export function barStartTime(timeline: readonly SectionTiming[], bar: number): n
   return totalDuration(timeline)
 }
 
+/**
+ * Quarter notes from song start to a time, following each section's tempo: what MIDI clock
+ * ticks and Song Position Pointer count. A time past the end of the song counts to the end.
+ */
+export function quarterNotesAt(timeline: readonly SectionTiming[], seconds: number): number {
+  let quarters = 0
+  for (const t of timeline) {
+    if (seconds <= t.startTime) break
+    quarters += (Math.min(seconds, t.startTime + t.duration) - t.startTime) * (t.tempo / 60)
+  }
+  return quarters
+}
+
 export interface TimeRange {
   /** Seconds from song start. */
   start: number

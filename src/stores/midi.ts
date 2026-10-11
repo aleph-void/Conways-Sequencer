@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, type Ref } from 'vue'
 import { allOutputsOff, isWebMidiSupported } from '../core/midi'
 
 export type MidiStatus = 'unsupported' | 'idle' | 'requesting' | 'ready' | 'denied' | 'error'
@@ -12,6 +12,7 @@ export interface OutputInfo {
 }
 
 export const OUTPUT_STORAGE_KEY = 'conways-sequencer:output'
+export const SYNC_OUTPUT_STORAGE_KEY = 'conways-sequencer:sync-output'
 
 /** Minimal subset of MIDIAccess we need, so tests can pass a fake. */
 export interface MidiAccessLike {
@@ -30,26 +31,49 @@ export interface MidiOutputLike {
 
 export type RequestMidiAccess = () => Promise<MidiAccessLike>
 
+/**
+ * Web MIDI access and the two outputs the app sends to, both remembered across reloads:
+ *  - the output (the "interface"): the module, which gets the gates, the x16 clock and the
+ *    play gate;
+ *  - the sync output: optional, for a DAW or other gear that should follow the transport. It
+ *    gets MIDI clock, Start, Continue, Stop and Song Position Pointer, and nothing else.
+ * They may be the same port.
+ */
 export const useMidiStore = defineStore('midi', () => {
   const supported = isWebMidiSupported()
   const status = ref<MidiStatus>(supported ? 'idle' : 'unsupported')
   const error = ref<string | null>(null)
   const outputs = ref<OutputInfo[]>([])
-  const selectedOutputId = ref<string | null>(readStoredOutput())
-  /** Count of messages handed to the output; handy for tests and a tiny activity indicator. */
+  const selectedOutputId = ref<string | null>(readStored(OUTPUT_STORAGE_KEY))
+  const syncOutputId = ref<string | null>(readStored(SYNC_OUTPUT_STORAGE_KEY))
+  /** Count of messages handed to each output; handy for tests and a tiny activity indicator. */
   const sentCount = ref(0)
+  const syncSentCount = ref(0)
 
   // The native MIDIAccess object is kept out of Vue reactivity on purpose.
   let access: MidiAccessLike | null = null
 
   const selectedOutput = computed(() => outputs.value.find((o) => o.id === selectedOutputId.value) ?? null)
   const isConnected = computed(() => status.value === 'ready' && selectedOutput.value !== null)
+  const syncOutput = computed(() => outputs.value.find((o) => o.id === syncOutputId.value) ?? null)
+  const isSyncConnected = computed(() => status.value === 'ready' && syncOutput.value !== null)
 
-  function readStoredOutput(): string | null {
+  function readStored(key: string): string | null {
     try {
-      return typeof localStorage === 'undefined' ? null : localStorage.getItem(OUTPUT_STORAGE_KEY)
+      return typeof localStorage === 'undefined' ? null : localStorage.getItem(key)
     } catch {
       return null
+    }
+  }
+
+  function store(key: string, id: string | null) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        if (id) localStorage.setItem(key, id)
+        else localStorage.removeItem(key)
+      }
+    } catch {
+      // ignore
     }
   }
 
@@ -64,10 +88,9 @@ export const useMidiStore = defineStore('midi', () => {
       manufacturer: o.manufacturer ?? '',
       state: o.state ?? 'connected',
     }))
-    if (selectedOutputId.value && !outputs.value.some((o) => o.id === selectedOutputId.value)) {
-      // Keep the preference so the device is re-selected when it comes back.
-      return
-    }
+    // A missing device keeps its preference (for either output) so it is re-selected when it
+    // comes back. The sync output is never picked automatically: most setups have none.
+    if (selectedOutputId.value && !outputs.value.some((o) => o.id === selectedOutputId.value)) return
     if (!selectedOutputId.value && outputs.value.length === 1) selectedOutputId.value = outputs.value[0]!.id
   }
 
@@ -103,32 +126,35 @@ export const useMidiStore = defineStore('midi', () => {
 
   function selectOutput(id: string | null) {
     selectedOutputId.value = id
-    try {
-      if (typeof localStorage !== 'undefined') {
-        if (id) localStorage.setItem(OUTPUT_STORAGE_KEY, id)
-        else localStorage.removeItem(OUTPUT_STORAGE_KEY)
-      }
-    } catch {
-      // ignore
-    }
+    store(OUTPUT_STORAGE_KEY, id)
   }
 
-  function rawOutput(): MidiOutputLike | null {
-    if (!access || !selectedOutputId.value) return null
-    return access.outputs.get(selectedOutputId.value) ?? null
+  /** Choose the sync output, or none (`null`) to send no sync messages at all. */
+  function selectSyncOutput(id: string | null) {
+    syncOutputId.value = id
+    store(SYNC_OUTPUT_STORAGE_KEY, id)
   }
 
-  /** Send a message at an absolute DOMHighResTimeStamp (ms). Silently no-ops without an output. */
-  function send(data: number[], timestamp?: number) {
-    const out = rawOutput()
+  function sendTo(id: string | null, data: number[], timestamp: number | undefined, count: Ref<number>) {
+    const out = access && id ? access.outputs.get(id) : null
     if (!out) return false
     try {
       out.send(data, timestamp)
-      sentCount.value += 1
+      count.value += 1
       return true
     } catch {
       return false
     }
+  }
+
+  /** Send a message to the output at an absolute DOMHighResTimeStamp (ms). Silently no-ops without one. */
+  function send(data: number[], timestamp?: number) {
+    return sendTo(selectedOutputId.value, data, timestamp, sentCount)
+  }
+
+  /** Send a message to the sync output at an absolute DOMHighResTimeStamp (ms). Silently no-ops without one. */
+  function sendSync(data: number[], timestamp?: number) {
+    return sendTo(syncOutputId.value, data, timestamp, syncSentCount)
   }
 
   /** Note-off for every possible output on the module, then All Notes Off. */
@@ -143,6 +169,7 @@ export const useMidiStore = defineStore('midi', () => {
     status.value = supported ? 'idle' : 'unsupported'
     error.value = null
     sentCount.value = 0
+    syncSentCount.value = 0
   }
 
   return {
@@ -154,10 +181,16 @@ export const useMidiStore = defineStore('midi', () => {
     selectedOutput,
     isConnected,
     sentCount,
+    syncOutputId,
+    syncOutput,
+    isSyncConnected,
+    syncSentCount,
     requestAccess,
     refreshOutputs,
     selectOutput,
+    selectSyncOutput,
     send,
+    sendSync,
     panic,
     reset,
   }

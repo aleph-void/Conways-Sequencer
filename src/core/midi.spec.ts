@@ -1,15 +1,21 @@
 import { describe, expect, it } from 'vitest'
 import {
   CLOCK_NOTE,
+  CONTINUE,
   DEFAULT_PLAY_GATE_NOTE,
+  START,
+  STOP,
+  TIMING_CLOCK,
   allNotesOff,
   allOutputsOff,
+  isRealTime,
   isWebMidiSupported,
   noteName,
   noteOff,
   noteOffFor,
   noteOn,
   outputToNote,
+  songPositionPointer,
   statusByte,
 } from './midi'
 
@@ -91,5 +97,24 @@ describe('isWebMidiSupported', () => {
     expect(isWebMidiSupported(undefined)).toBe(false)
     expect(isWebMidiSupported({} as Navigator)).toBe(false)
     expect(isWebMidiSupported({ requestMIDIAccess: () => Promise.reject() } as unknown as Navigator)).toBe(true)
+  })
+})
+
+describe('sync messages', () => {
+  it('encodes Song Position Pointer in MIDI beats, low seven bits first', () => {
+    expect(songPositionPointer(0)).toEqual([0xf2, 0, 0])
+    expect(songPositionPointer(1)).toEqual([0xf2, 4, 0]) // a quarter note is four sixteenths
+    expect(songPositionPointer(32.5)).toEqual([0xf2, 130 & 0x7f, 1]) // 130 beats = 0x82
+    expect(songPositionPointer(1.2)).toEqual([0xf2, 5, 0]) // 4.8 beats rounds to 5
+    expect(songPositionPointer(-3)).toEqual([0xf2, 0, 0])
+    expect(songPositionPointer(1e9)).toEqual([0xf2, 0x7f, 0x7f])
+  })
+
+  it('tells system real-time messages from everything else', () => {
+    for (const status of [TIMING_CLOCK, START, CONTINUE, STOP]) expect(isRealTime([status])).toBe(true)
+    expect(isRealTime(noteOn(1, 36, 100))).toBe(false)
+    expect(isRealTime(noteOff(1, 36))).toBe(false)
+    expect(isRealTime(songPositionPointer(4))).toBe(false)
+    expect(isRealTime([])).toBe(false)
   })
 })

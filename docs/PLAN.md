@@ -10,6 +10,7 @@ iteration was built against, with what shipped and what is left.
 | --- | --- |
 | Client-side only | Vite + Vue 3 + Pinia, static build, no backend. Songs autosave to a `localStorage` library browsed from a slide-out drawer, export/import as JSON. |
 | Select the MIDI output in the GUI | `navigator.requestMIDIAccess({ sysex: false })`; outputs listed in a `<select>`, choice persisted, `statechange` tracked for hot-plug. |
+| MIDI sync output | A second, optional output in `stores/midi.ts` (`syncOutputId`, `sendSync`, persisted under its own key, never auto-selected) picked in `MidiPanel.vue`. With one selected the transport compiles MIDI clock ticks (`compileSong(song, { syncClock: true })`: `kind: 'clock'`, 24 per quarter note per `MIDI_CLOCKS_PER_QUARTER`, following each section's tempo, never swung) into the same event list as the gates, so they share the scheduler's timeline and loop with it; the transport routes real-time messages (`isRealTime`) to the sync output and everything else to the module. `transport.start()` sends Start from the top of the song or Song Position Pointer (`quarterNotesAt` of the whole-song position) + Continue, stamped at `Scheduler.queuedUntil()` so a receiver counts exactly the new pass's ticks; `halt()` and `panic()` send Stop. |
 | Up to 62 channels | Hard cap `MAX_CHANNELS = 62`. A channel = one module output (shown 1-based). MIDI note = `baseNote + output`. The last two outputs are reserved for the x16 clock and the play gate. |
 | x16 clock | `CLOCK_NOTE = 98` is pulsed `CLOCK_PULSES_PER_BEAT = 16` times per beat while playing, compiled into the event list alongside the gates so it follows every section's tempo and time signature. Half-period pulses, never below the 2 ms retrigger gap. Independent of the base note; mute and solo do not affect it. |
 | Play gate | `settings.playGateNote` (default `DEFAULT_PLAY_GATE_NOTE = 99`, the module's 64th output) goes note-on when playback starts or resumes and note-off when it pauses or stops (manual stop, end of a non-looping song, or panic). Independent of the base note. |
@@ -45,16 +46,16 @@ src/
     song.ts        types, factories, step arithmetic, invariants
     timing.ts      tempo inheritance, step durations, section timeline, locate(time), locateStep(step)
     clipboard.ts   blocks of gates: read a rectangle of cells out of a song, write one back
-    midi.ts        message builders, output→note mapping, note names
-    compile.ts     Song → sorted MidiEvent[] (the "render" step)
+    midi.ts        message builders (notes, sync: clock/Start/Stop/Continue/Song Position), output→note mapping, note names
+    compile.ts     Song → sorted MidiEvent[] (the "render" step), MIDI clock ticks on request
     scheduler.ts   look-ahead scheduler: hands events to the port with timestamps
     module.ts      the module's panel: output layout and which notes are high at a position
     serialization.ts  JSON export/import with validation + clamping
     library.ts     the song library in localStorage: index + one key per song
   stores/          Pinia
     song.ts        the document + all edits + autosave + library (open/new/duplicate/delete)
-    midi.ts        Web MIDI access, outputs, selection, send(), panic()
-    transport.ts   play/stop/position/seek, wires compile + scheduler + midi
+    midi.ts        Web MIDI access, outputs, the module and sync output selections, send()/sendSync(), panic()
+    transport.ts   play/stop/position/seek, wires compile + scheduler + midi, drives the sync output
     editor.ts      the selected block and the clipboard (copy/cut/paste at the cursor/delete)
   components/      Vue SFCs, thin over the stores
     AppHeader, MidiPanel, TransportBar, SettingsPanel,
@@ -125,9 +126,6 @@ coverage is ~97 % lines.
   currently yields two gates.
 - **Swing / per-step velocity** — velocity is global because the module only
   reads gates; swing would be a per-section offset applied in `compile.ts`.
-- **MIDI clock out / external sync** — the module has a clock input; sending
-  MIDI clock (0xF8) from the scheduler is a small addition if a MIDI-to-clock
-  converter is in the rack.
 - **Game-of-Life helpers** — seed a section from a Life pattern, or step a
   pattern per bar, as a nod to the module's other mode.
 - **Hardware verification** — the fake MIDI port proves the bytes; a real

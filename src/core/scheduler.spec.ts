@@ -225,4 +225,51 @@ describe('Scheduler', () => {
     scheduler.stop()
     expect(onStop).toHaveBeenCalledTimes(1)
   })
+
+  describe('clock ticks', () => {
+    const tick = (time: number): MidiEvent => ({ time, kind: 'clock', note: -1, data: [0xf8] })
+
+    it('sends them without tracking them as sounding notes', () => {
+      scheduler.load([tick(0), ev(0, 'on', 40), tick(0.02), tick(0.04), ev(5, 'off', 40)], 10, false)
+      scheduler.start()
+      expect(sent.map((s) => s.data)).toEqual([[0xf8], [0x90, 40, 100], [0xf8], [0xf8]])
+      vi.advanceTimersByTime(50)
+      scheduler.stop()
+      // Only the gate is released: a tick has nothing to turn off.
+      expect(sent.slice(4)).toEqual([{ data: [0x80, 40, 0], at: 50 }])
+    })
+
+    it('never re-raises them as spanning gates when starting mid-song', () => {
+      scheduler.load([tick(0), tick(0.5), ev(1, 'on'), ev(1.1, 'off')], 2, false)
+      scheduler.start(0.75)
+      expect(sent).toEqual([])
+      vi.advanceTimersByTime(300)
+      expect(sent.map((s) => s.data[0])).toEqual([0x90, 0x80])
+    })
+
+    it('keeps them when reloading, without re-sending those already out', () => {
+      scheduler.load([tick(0), tick(0.05), tick(0.5)], 1, true)
+      scheduler.start()
+      expect(sent.map((s) => s.at)).toEqual([0, 50])
+      scheduler.load([tick(0), tick(0.05), tick(0.1), tick(0.5)], 1, true)
+      vi.advanceTimersByTime(100)
+      expect(sent.map((s) => s.at)).toEqual([0, 50, 100])
+    })
+  })
+
+  it('reports when the next message can go out', () => {
+    expect(scheduler.queuedUntil()).toBe(0)
+    scheduler.load([ev(0.09, 'on', 41), ev(5, 'off', 41)], 10, false)
+    scheduler.start()
+    // Running, nothing can go out before the note-on already queued for 90 ms...
+    expect(scheduler.queuedUntil()).toBe(90)
+    vi.advanceTimersByTime(200)
+    // ...until the clock has moved past it.
+    expect(scheduler.queuedUntil()).toBe(200)
+    // A restart queues the note-on for 290 ms; stopped, it is simply now, whatever was queued.
+    scheduler.start()
+    expect(scheduler.queuedUntil()).toBe(290)
+    scheduler.stop()
+    expect(scheduler.queuedUntil()).toBe(200)
+  })
 })
